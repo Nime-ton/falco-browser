@@ -1,0 +1,19 @@
+[package]
+name = "Falco"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wry = "0.35.0"
+tao = "0.23.0"  # Понизили до 23-й версии для совместимости
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[build-dependencies]
+winres = "0.1"
