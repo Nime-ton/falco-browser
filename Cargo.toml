@@ -3,10 +3,25 @@ name = "Falco"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# cargo build --release --features native-adblock
+native-adblock = ["dep:adblock", "dep:rmp"]
+
 [dependencies]
 wry = "0.35.0"
 tao = "0.23.0"  # Понизили до 23-й версии для совместимости
-image = { version = "0.24", default-features = false, features = ["png"] }
+# Нужны только для нативного блокировщика (версии совпадают с теми, что тянет wry 0.35)
+adblock = { version = "0.9", optional = true }
+# rmp-serde 0.15 (зависимость adblock 0.9) ломается на rmp >= 0.8.12, поэтому версия закреплена
+rmp = { version = "=0.8.11", optional = true }
+
+# Эти два крейта wry 0.35 и так подключает на Windows (те же версии, см. Cargo.lock),
+# поэтому явное подключение размер программы не увеличивает.
+# Нужны для разрешения камеры/микрофона (media_permissions) и для native-adblock.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.28"
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_WinRT", "Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = "z"
@@ -14,6 +29,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Весь браузер собирается на минимальный размер ("z"), но сопоставление правил в движке adblock
+# вызывается на каждый запрос страницы - ему нужна скорость, а не размер (в сборке без native-adblock не влияет)
+[profile.release.package.adblock]
+opt-level = 3
 
 [build-dependencies]
 winres = "0.1"
