@@ -24,16 +24,11 @@ webview2-com = "0.28"
 windows = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_WinRT", "Win32_UI_Shell"] }
 
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-
-# Весь браузер собирается на минимальный размер ("z"), но сопоставление правил в движке adblock
-# вызывается на каждый запрос страницы - ему нужна скорость, а не размер (в сборке без native-adblock не влияет)
-[profile.release.package.adblock]
-opt-level = 3
 
 [build-dependencies]
 winres = "0.1"
