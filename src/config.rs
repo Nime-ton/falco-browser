@@ -33,6 +33,11 @@ pub(crate) struct Settings {
     pub(crate) yt_force_h264: bool,
     /// Закрепить верхнюю панель (вкладки и адресную строку), чтобы она не пряталась и не перекрывала сайты
     pub(crate) pin_top_bar: bool,
+    /// Закреплённые вкладки "живые": у каждой свой WebView, который продолжает работать в фоне
+    /// (музыка, видео, звонки), пока вы сидите в обычных вкладках
+    pub(crate) live_pinned: bool,
+    /// Перед каждой загрузкой спрашивать, куда сохранить файл (окно "Сохранить как")
+    pub(crate) ask_download: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +53,8 @@ impl Default for Settings {
             webrtc_hide_ip: true,
             yt_force_h264: false,
             pin_top_bar: false,
+            live_pinned: true,
+            ask_download: false,
         }
     }
 }
@@ -89,6 +96,8 @@ impl Settings {
                     "webrtc_hide_ip" => s.webrtc_hide_ip = v == "1" || v.eq_ignore_ascii_case("true"),
                     "yt_force_h264" => s.yt_force_h264 = v == "1" || v.eq_ignore_ascii_case("true"),
                     "pin_top_bar" => s.pin_top_bar = v == "1" || v.eq_ignore_ascii_case("true"),
+                    "live_pinned" => s.live_pinned = v == "1" || v.eq_ignore_ascii_case("true"),
+                    "ask_download" => s.ask_download = v == "1" || v.eq_ignore_ascii_case("true"),
                     _ => {}
                 }
             }
@@ -108,7 +117,9 @@ impl Settings {
              smartscreen={}\n\
              webrtc_hide_ip={}\n\
              yt_force_h264={}\n\
-             pin_top_bar={}\n",
+             pin_top_bar={}\n\
+             live_pinned={}\n\
+             ask_download={}\n",
             self.start_url,
             self.search_engine,
             if self.restore_session { 1 } else { 0 },
@@ -119,6 +130,8 @@ impl Settings {
             if self.webrtc_hide_ip { 1 } else { 0 },
             if self.yt_force_h264 { 1 } else { 0 },
             if self.pin_top_bar { 1 } else { 0 },
+            if self.live_pinned { 1 } else { 0 },
+            if self.ask_download { 1 } else { 0 },
         );
         let tmp = path.with_extension("tmp");
         if fs::write(&tmp, content).is_ok() {
@@ -138,7 +151,7 @@ impl Settings {
 
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"start_url\":{},\"search_engine\":{},\"search_prefix\":{},\"restore_session\":{},\"download_dir\":{},\"history_enabled\":{},\"media_mode\":{},\"smartscreen\":{},\"webrtc_hide_ip\":{},\"yt_force_h264\":{},\"pin_top_bar\":{}}}",
+            "{{\"start_url\":{},\"search_engine\":{},\"search_prefix\":{},\"restore_session\":{},\"download_dir\":{},\"history_enabled\":{},\"media_mode\":{},\"smartscreen\":{},\"webrtc_hide_ip\":{},\"yt_force_h264\":{},\"pin_top_bar\":{},\"live_pinned\":{},\"ask_download\":{}}}",
             json_quote(&self.start_url),
             json_quote(&self.search_engine),
             json_quote(self.search_url_prefix()),
@@ -149,7 +162,9 @@ impl Settings {
             self.smartscreen,
             self.webrtc_hide_ip,
             self.yt_force_h264,
-            self.pin_top_bar
+            self.pin_top_bar,
+            self.live_pinned,
+            self.ask_download
         )
     }
 }

@@ -1,4 +1,4 @@
-//! Доступ к камере и микрофону.
+//! Доступ к камере и микрофону + отслеживание звука и приглушение вкладок (ICoreWebView2_8).
 
 use std::fs;
 use std::path::Path;
@@ -82,4 +82,65 @@ pub(crate) mod permissions {
         }
         Ok(())
     }
+}
+
+/// Отслеживание проигрывания звука и управление Mute через ICoreWebView2_8.
+pub(crate) mod audio {
+    use tao::event_loop::EventLoopProxy;
+
+    #[cfg(windows)]
+    pub fn install(webview: &wry::WebView, proxy: EventLoopProxy<String>, live_id: Option<u32>) -> windows::core::Result<()> {
+        use webview2_com::IsDocumentPlayingAudioChangedEventHandler;
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8;
+        use windows::core::ComInterface;
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::WinRT::EventRegistrationToken;
+        use wry::WebViewExtWindows;
+
+        unsafe {
+            let controller = webview.controller();
+            let core = controller.CoreWebView2()?;
+            let core8: ICoreWebView2_8 = core.cast()?;
+            let handler = IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _| {
+                if let Some(s) = sender {
+                    if let Ok(c8) = s.cast::<ICoreWebView2_8>() {
+                        let mut playing = BOOL::default();
+                        let _ = c8.IsDocumentPlayingAudio(&mut playing);
+                        let p = if playing.as_bool() { "1" } else { "0" };
+                        let ev = match live_id {
+                            Some(id) => format!("LV{}~AUDIO|{}", id, p),
+                            None => format!("AUDIO|{}", p),
+                        };
+                        let _ = proxy.send_event(ev);
+                    }
+                }
+                Ok(())
+            }));
+            let mut token = EventRegistrationToken::default();
+            core8.add_IsDocumentPlayingAudioChanged(&handler, &mut token)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn install(_webview: &wry::WebView, _proxy: EventLoopProxy<String>, _live_id: Option<u32>) {}
+
+    #[cfg(windows)]
+    pub fn set_muted(webview: &wry::WebView, muted: bool) {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8;
+        use windows::core::ComInterface;
+        use windows::Win32::Foundation::BOOL;
+        use wry::WebViewExtWindows;
+
+        unsafe {
+            if let Ok(core) = webview.controller().CoreWebView2() {
+                if let Ok(core8) = core.cast::<ICoreWebView2_8>() {
+                    let _ = core8.SetIsMuted(BOOL::from(muted));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_muted(_webview: &wry::WebView, _muted: bool) {}
 }
