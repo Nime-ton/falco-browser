@@ -1,10 +1,85 @@
-//! Блокировщик рекламы: разбор списков фильтров (hosts, ||domain^, косметические правила).
+//! Блокировщик рекламы: разбор списков фильтров (hosts, ||domain^, косметические правила), белый список (whitelist.txt) и онлайн-обновление.
 
 use std::fs;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use crate::util::*;
+
+pub(crate) const WHITELIST_EXAMPLE: &str = "# Белый список сайтов (кнопка «Щит» в адресной строке).\n# На этих доменах (и их поддоменах) блокировщик рекламы отключён.\n# По одному домену в строке.\n";
+
+pub(crate) fn load_whitelist(path: &Path) -> HashSet<String> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && valid_domain(l))
+        .collect()
+}
+
+pub(crate) fn save_whitelist(path: &Path, set: &HashSet<String>) {
+    let mut list: Vec<&String> = set.iter().collect();
+    list.sort();
+    let mut s = String::from(WHITELIST_EXAMPLE);
+    for d in list {
+        s.push_str(d);
+        s.push('\n');
+    }
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, s).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+pub(crate) fn is_whitelisted_host(host: &str, wl: &HashSet<String>) -> bool {
+    let h = host.to_ascii_lowercase();
+    has_ancestor(wl, &h)
+}
+
+pub(crate) fn is_whitelisted_url(url: &str, wl: &HashSet<String>) -> bool {
+    match host_of(url) {
+        Some(h) => is_whitelisted_host(&h, wl),
+        None => false,
+    }
+}
+
+/// Переключает статус сайта в белом списке.
+/// Если поддомен уже покрыт родительским доменом в списке — удаляет родительский домен, иначе добавляет базовый хост.
+/// Возвращает Some(true), если сайт теперь в белом списке (защита выключена), Some(false) — если удалён (защита включена).
+pub(crate) fn toggle_whitelist(path: &Path, wl: &mut HashSet<String>, url: &str) -> Option<bool> {
+    let host = host_of(url)?;
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    if !valid_domain(&host) {
+        return None;
+    }
+    let mut matching = Vec::new();
+    let mut h = host.as_str();
+    loop {
+        if wl.contains(h) {
+            matching.push(h.to_string());
+        }
+        match h.find('.') {
+            Some(i) => h = &h[i + 1..],
+            None => break,
+        }
+    }
+    let now_whitelisted = if !matching.is_empty() {
+        for m in matching {
+            wl.remove(&m);
+        }
+        false
+    } else {
+        wl.insert(host);
+        true
+    };
+    save_whitelist(path, wl);
+    Some(now_whitelisted)
+}
+
+pub(crate) fn whitelist_csv(wl: &HashSet<String>) -> String {
+    let mut v: Vec<&str> = wl.iter().map(|s| s.as_str()).collect();
+    v.sort_unstable();
+    v.join(",")
+}
 
 pub(crate) const AD_HOSTS: &[&str] = &[
     "amazon-adsystem.com", "adnxs.com", "criteo.com", "criteo.net", "taboola.com", "outbrain.com", "mgid.com", "adskeeper.com",
@@ -30,6 +105,198 @@ pub(crate) const NO_DNS: &[&str] = &[
     "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
     "googletagmanager.com", "googletagservices.com", "2mdn.net", "adservice.google.com",
 ];
+
+/// Списки фильтров, вшитые в exe при сборке (файлы лежат в <проект>/lists/).
+/// Без них exe на чужом ПК получал только короткий встроенный набор правил.
+const EMBEDDED_LISTS: &[(&str, &[u8])] = &[
+    ("easylist.txt", include_bytes!("../lists/easylist.txt")),
+    ("easyprivacy.txt", include_bytes!("../lists/easyprivacy.txt")),
+];
+
+/// Официальные URL для обновления списков фильтров по кнопке в Настройках.
+/// Списки для онлайн-обновления: файл в папке filters и адреса по порядку (если первый недоступен, пробуем зеркало).
+pub(crate) const FILTER_SOURCES: &[(&str, &[&str])] = &[
+    (
+        "easylist.txt",
+        &["https://easylist.to/easylist/easylist.txt", "https://secure.fanboy.co.nz/easylist.txt"],
+    ),
+    (
+        "easyprivacy.txt",
+        &["https://easylist.to/easylist/easyprivacy.txt", "https://secure.fanboy.co.nz/easyprivacy.txt"],
+    ),
+];
+
+/// Номер версии из заголовка списка ("! Version: 202610222129") или None.
+fn list_version(head: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(head);
+    for line in text.lines().take(20) {
+        if let Some(v) = line.trim().strip_prefix("! Version:") {
+            return v.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Версия списка, лежащего на диске (читаем только начало файла).
+fn file_version(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path).ok()?.take(4096).read_to_end(&mut buf).ok()?;
+    list_version(&buf)
+}
+
+/// Раскладывает вшитые списки в папку фильтров.
+/// - Файла нет -> создаётся.
+/// - Файл есть и в нём указана версия СТАРШЕ вшитой -> заменяется новой (так списки обновляются
+///   вместе с exe). Свои правила держите в отдельном файле (например my.txt): easylist.txt и
+///   easyprivacy.txt могут быть перезаписаны. Если у файла нет версии или она не старше - он не трогается.
+/// - Есть `_easylist.txt` (список отключён переименованием, файлы с `_` игнорируются) -> не создаётся.
+pub(crate) fn seed_embedded_lists(dir: &Path) {
+    let _ = fs::create_dir_all(dir);
+    for (name, data) in EMBEDDED_LISTS {
+        let data: &[u8] = data;
+        let active = dir.join(name);
+        if dir.join(format!("_{}", name)).exists() {
+            continue;
+        }
+        let need = if active.exists() {
+            match (file_version(&active), list_version(&data[..data.len().min(4096)])) {
+                (Some(old), Some(new)) => new > old,
+                _ => false,
+            }
+        } else {
+            true
+        };
+        if !need {
+            continue;
+        }
+        // сначала во временный файл (расширение не .txt), чтобы недописанный список не загрузился
+        let tmp = dir.join(format!("{}.tmp", name));
+        if fs::write(&tmp, data).is_ok() && fs::rename(&tmp, &active).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+fn download_url_to_file(url: &str, dest: &Path) -> Result<(), String> {
+    let dest_str = dest.to_str().ok_or_else(|| "Некорректный путь к файлу".to_string())?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let curl_ok = std::process::Command::new("curl.exe")
+            .args(["-fsSL", "--max-time", "45", "-A", "Mozilla/5.0 Falco", "-o", dest_str, url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if curl_ok {
+            return Ok(());
+        }
+
+        let ps_cmd = format!(
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing -TimeoutSec 45",
+            url,
+            dest_str.replace('\'', "''")
+        );
+        let ps_ok = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if ps_ok {
+            Ok(())
+        } else {
+            Err(format!("Не удалось скачать {}", url))
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let ok = std::process::Command::new("curl")
+            .args(["-fsSL", "--max-time", "45", "-A", "Mozilla/5.0 Falco", "-o", dest_str, url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("Не удалось скачать {}", url))
+        }
+    }
+}
+
+/// Пробует адреса по очереди, пока один не скачается.
+fn download_first(urls: &[&str], dest: &Path) -> Result<(), String> {
+    let mut last = String::from("Нет адресов для скачивания");
+    for u in urls {
+        match download_url_to_file(u, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(dest);
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Скачивает свежие списки фильтров (easylist.txt, easyprivacy.txt) в папку `dir`.
+/// Возвращает количество обновлённых списков.
+pub(crate) fn update_filter_lists(dir: &Path) -> Result<usize, String> {
+    let _ = fs::create_dir_all(dir);
+    let mut updated = 0usize;
+    let mut last_err = None;
+
+    for (name, urls) in FILTER_SOURCES {
+        if dir.join(format!("_{}", name)).exists() {
+            continue;
+        }
+        let tmp = dir.join(format!("{}.download.tmp", name));
+        let _ = fs::remove_file(&tmp);
+        match download_first(urls, &tmp) {
+            Ok(()) => {
+                let bytes = match fs::read(&tmp) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = fs::remove_file(&tmp);
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                };
+                let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+                let head_trim = head.trim_start_matches('\u{feff}').trim_start();
+                if bytes.len() < 10_000 || !(head_trim.starts_with("[Adblock") || head_trim.starts_with('!')) {
+                    let _ = fs::remove_file(&tmp);
+                    last_err = Some(format!("Файл {} повреждён или не является списком фильтров", name));
+                    continue;
+                }
+                let active = dir.join(name);
+                if fs::rename(&tmp, &active).is_ok() {
+                    updated += 1;
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                    last_err = Some(format!("Не удалось сохранить {}", name));
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if updated > 0 {
+        Ok(updated)
+    } else {
+        Err(last_err.unwrap_or_else(|| "Все списки отключены".to_string()))
+    }
+}
 
 pub(crate) const DNS_BUDGET: usize = 20_000;
 
@@ -141,34 +408,19 @@ pub(crate) fn parse_cosmetic(line: &str) -> Option<(Vec<String>, String)> {
             }
             doms.push(d);
         }
+    } else {
+        // Глобальные правила с поиском подстрок в атрибутах ([class*="..."], [id^="..."])
+        // заставляют движок браузера проверять строки на каждом узле при стриминге DOM
+        if sel.contains("*=") || sel.contains("^=") || sel.contains("$=") {
+            return None;
+        }
     }
     Some((doms, sel.to_string()))
 }
 
 pub(crate) fn load_filters(dir: &Path) -> Filters {
-    // 1. Проверяем, существует ли папка или пуста ли она (нет файлов .txt)
-    let txt_files = list_files(dir, "txt");
-    if txt_files.is_empty() {
-        let _ = fs::create_dir_all(dir);
-        let default_file = dir.join("block.txt");
-        // Зашитая строка с дефолтными правилами блокировки
-        let default_rules = 
-            "! Встроенные дефолтные фильтры Falco\n\
-             ||doubleclick.net^\n\
-             ||googlesyndication.com^\n\
-             ||googleadservices.com^\n\
-             ||adservice.google.com^\n\
-             ||mc.yandex.ru^\n\
-             ||an.yandex.ru^\n\
-             ||amazon-adsystem.com^\n\
-             ||criteo.com^\n\
-             ||taboola.com^\n\
-             ||outbrain.com^\n\
-             ||propellerads.com^\n\
-             ||popads.net^\n";
-        let _ = fs::write(&default_file, default_rules);
-    }
-
+    // Папку и списки создаёт seed_embedded_lists (main.rs). Если списков нет совсем,
+    // работают встроенные AD_HOSTS.
     let mut blocked: Vec<String> = Vec::new();
     let mut allowed: HashSet<String> = HashSet::new();
     let mut generic: Vec<String> = Vec::new();
@@ -280,5 +532,55 @@ mod tests {
     fn unsupported_rules_are_rejected() {
         assert_eq!(parse_network_rule("||example.com/path"), None);
         assert_eq!(parse_network_rule("||example.com^$script"), None);
+    }
+
+    #[test]
+    fn whitelist_toggle_works_for_subdomains() {
+        let dir = tmp_dir("wl");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("whitelist.txt");
+        let mut wl = HashSet::new();
+        assert_eq!(toggle_whitelist(&path, &mut wl, "https://www.example.com/pay"), Some(true));
+        assert!(is_whitelisted_url("https://sub.example.com/a", &wl));
+        assert_eq!(toggle_whitelist(&path, &mut wl, "https://sub.example.com/a"), Some(false));
+        assert!(!is_whitelisted_url("https://example.com/", &wl));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("falco-filters-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn list_version_is_parsed() {
+        assert_eq!(list_version(b"[Adblock Plus 2.0]\r\n! Version: 202610222129\r\n! Title: X"), Some(202610222129));
+        assert_eq!(list_version(b"||a.com^\n"), None);
+    }
+
+    #[test]
+    fn seed_creates_updates_and_respects_user_choices() {
+        let dir = tmp_dir("seed");
+        seed_embedded_lists(&dir);
+        assert!(dir.join("easylist.txt").exists());
+        assert!(dir.join("easyprivacy.txt").exists());
+
+        // старая версия заменяется вшитой
+        fs::write(dir.join("easylist.txt"), "! Version: 1\n||old.example^\n").unwrap();
+        seed_embedded_lists(&dir);
+        assert!(fs::metadata(dir.join("easylist.txt")).unwrap().len() > 1000);
+
+        // файл без версии (самодельный) не трогаем
+        fs::write(dir.join("easyprivacy.txt"), "||mine.example^\n").unwrap();
+        seed_embedded_lists(&dir);
+        assert_eq!(fs::read_to_string(dir.join("easyprivacy.txt")).unwrap(), "||mine.example^\n");
+
+        // отключённый список не возвращается
+        fs::remove_file(dir.join("easylist.txt")).unwrap();
+        fs::write(dir.join("_easylist.txt"), "x").unwrap();
+        seed_embedded_lists(&dir);
+        assert!(!dir.join("easylist.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,7 +1,164 @@
-//! Вкладки: ярлыки, проверка навигации, JS-команды и фильтр устаревших сообщений от страниц.
+//! Вкладки: ярлыки, метаданные (уникальный id, звук, изолированная история переходов), проверка навигации и фильтр сообщений.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::util::*;
+
+/// Максимальная глубина истории «Назад / Вперёд» внутри одной вкладки.
+pub(crate) const TAB_HIST_MAX: usize = 60;
+
+pub(crate) fn next_tab_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn same_nav_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// Изолированная история переходов («Назад / Вперёд») конкретной вкладки.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabHist {
+    pub(crate) entries: Vec<String>,
+    pub(crate) cur: usize,
+    /// Флаг активного программного перехода (переключение вкладки, шаг назад/вперёд),
+    /// чтобы редирект или нормализация слеша не затирали ветку «Вперёд».
+    pub(crate) in_step: bool,
+}
+
+impl TabHist {
+    pub(crate) fn new(url: &str) -> Self {
+        let mut entries = Vec::new();
+        if !url.is_empty() {
+            entries.push(url.to_string());
+        }
+        Self {
+            entries,
+            cur: 0,
+            in_step: true,
+        }
+    }
+
+    pub(crate) fn can_back(&self) -> bool {
+        self.cur > 0
+    }
+
+    pub(crate) fn can_forward(&self) -> bool {
+        self.cur + 1 < self.entries.len()
+    }
+
+    pub(crate) fn step_back(&mut self) -> Option<String> {
+        if self.cur > 0 {
+            self.cur -= 1;
+            self.in_step = true;
+            self.entries.get(self.cur).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn step_forward(&mut self) -> Option<String> {
+        if self.cur + 1 < self.entries.len() {
+            self.cur += 1;
+            self.in_step = true;
+            self.entries.get(self.cur).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn record(&mut self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        if self.entries.is_empty() {
+            self.entries.push(url.to_string());
+            self.cur = 0;
+            self.in_step = false;
+            return;
+        }
+        if self.cur >= self.entries.len() {
+            self.cur = self.entries.len() - 1;
+        }
+        if same_nav_url(&self.entries[self.cur], url) {
+            self.entries[self.cur] = url.to_string();
+            self.in_step = false;
+            return;
+        }
+        if self.in_step {
+            self.entries[self.cur] = url.to_string();
+            self.in_step = false;
+            return;
+        }
+        if self.cur > 0 && same_nav_url(&self.entries[self.cur - 1], url) {
+            self.cur -= 1;
+            self.entries[self.cur] = url.to_string();
+            return;
+        }
+        if self.cur + 1 < self.entries.len() && same_nav_url(&self.entries[self.cur + 1], url) {
+            self.cur += 1;
+            self.entries[self.cur] = url.to_string();
+            return;
+        }
+        self.entries.truncate(self.cur + 1);
+        self.entries.push(url.to_string());
+        if self.entries.len() > TAB_HIST_MAX {
+            let drop_n = self.entries.len() - TAB_HIST_MAX;
+            self.entries.drain(0..drop_n);
+        }
+        self.cur = self.entries.len() - 1;
+    }
+}
+
+/// Метаданные вкладки: уникальный идентификатор (для связи с Live-WebView), состояние звука и история переходов.
+#[derive(Clone, Debug)]
+pub(crate) struct TabMeta {
+    pub(crate) id: u64,
+    pub(crate) muted: bool,
+    pub(crate) hist: TabHist,
+}
+
+impl TabMeta {
+    pub(crate) fn new(url: &str) -> Self {
+        Self {
+            id: next_tab_id(),
+            muted: false,
+            hist: TabHist::new(url),
+        }
+    }
+}
+
+/// Закрытая вкладка для возврата через Ctrl+Shift+T (вместе с её историей переходов).
+#[derive(Clone, Debug)]
+pub(crate) struct ClosedTab {
+    pub(crate) url: String,
+    pub(crate) index: usize,
+    pub(crate) was_pinned: bool,
+    pub(crate) hist: TabHist,
+}
+
+/// Гарантирует, что вектор метаданных совпадает по длине со списком вкладок.
+pub(crate) fn ensure_metas(tabs: &[String], metas: &mut Vec<TabMeta>) {
+    while metas.len() < tabs.len() {
+        let u = &tabs[metas.len()];
+        metas.push(TabMeta::new(u));
+    }
+    metas.truncate(tabs.len());
+}
+
+pub(crate) fn nav_state_js(metas: &[TabMeta], current_tab: usize) -> String {
+    let (b, f) = metas
+        .get(current_tab)
+        .map(|m| (m.hist.can_back(), m.hist.can_forward()))
+        .unwrap_or((false, false));
+    format!(
+        "if(window.__ulNavState) window.__ulNavState({},{});",
+        if b { "true" } else { "false" },
+        if f { "true" } else { "false" }
+    )
+}
 
 pub(crate) fn nav_script(url: &str, save_first: bool) -> String {
     let u = js_str(url);
@@ -71,6 +228,95 @@ pub(crate) fn tabs_labels(tabs: &[String], titles: &HashMap<String, String>, pin
     format!("{}\u{1e}{}", pinned.min(tabs.len()), labels)
 }
 
+/// Строка хостов для отображения иконок сайтов (favicon) на вкладках: "<хост1>|||<хост2>|||...".
+pub(crate) fn tabs_hosts(tabs: &[String]) -> String {
+    tabs.iter()
+        .map(|u| host_of(u).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("|||")
+}
+
+// ---------- Иконки сайтов (favicon) ----------
+// Каждая обычная вкладка - это новый документ, поэтому иконки нельзя хранить в JS: они пропадали при каждом
+// переключении. Хранит их Rust: ключ - хост без "www.", значение - base64 PNG (не длиннее FAV_MAX_B64).
+// Значение "!N" - "иконку получить не удалось" (N = число неудачных попыток, до 3; только на время сеанса).
+
+pub(crate) const FAV_MAX_B64: usize = 7000;
+pub(crate) const FAV_MAX_ENTRIES: usize = 300;
+
+/// Ключ иконки сайта: хост без "www.".
+pub(crate) fn fav_key(url: &str) -> Option<String> {
+    let h = host_of(url)?;
+    Some(h.strip_prefix("www.").map(|x| x.to_string()).unwrap_or(h))
+}
+
+/// Допустимое значение: base64 (PNG) или метка неудачи "!N".
+pub(crate) fn fav_value_ok(v: &str) -> bool {
+    if let Some(n) = v.strip_prefix('!') {
+        return !n.is_empty() && n.len() <= 2 && n.bytes().all(|b| b.is_ascii_digit());
+    }
+    !v.is_empty() && v.len() <= FAV_MAX_B64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// JS-вызов `__ulFavs('{"host":"<base64>",...}')` для перечисленных ключей (неизвестные пропускаются).
+pub(crate) fn favs_js_for(favs: &HashMap<String, String>, keys: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for k in keys {
+        if let Some(v) = favs.get(k) {
+            parts.push(format!("{}:{}", json_quote(k), json_quote(v)));
+        }
+    }
+    let json = format!("{{{}}}", parts.join(","));
+    format!("if(window.__ulFavs) window.__ulFavs('{}');", js_str(&json))
+}
+
+/// То же для всех сайтов, открытых во вкладках.
+pub(crate) fn favs_js(favs: &HashMap<String, String>, tabs: &[String]) -> String {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut keys: Vec<String> = Vec::new();
+    for u in tabs {
+        if let Some(k) = fav_key(u) {
+            if seen.insert(k.clone()) {
+                keys.push(k);
+            }
+        }
+    }
+    favs_js_for(favs, &keys)
+}
+
+/// Файл иконок: по строке "<хост>\t<base64>". Метки неудач на диск не пишем.
+pub(crate) fn load_favs(path: &Path) -> HashMap<String, String> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut m = HashMap::new();
+    for l in text.lines() {
+        if let Some((k, v)) = l.trim_end().split_once('\t') {
+            if !v.starts_with('!') && fav_value_ok(v) && valid_domain(k) {
+                m.insert(k.to_string(), v.to_string());
+            }
+        }
+        if m.len() >= FAV_MAX_ENTRIES {
+            break;
+        }
+    }
+    m
+}
+
+pub(crate) fn save_favs(path: &Path, favs: &HashMap<String, String>) {
+    let mut s = String::new();
+    for (k, v) in favs {
+        if !v.starts_with('!') {
+            s.push_str(k);
+            s.push('\t');
+            s.push_str(v);
+            s.push('\n');
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, s).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
 // ---------- Операции над списком вкладок (меню правой кнопки) ----------
 // `pinned` - число закреплённых вкладок; они всегда стоят в начале списка.
 
@@ -119,6 +365,7 @@ pub(crate) fn insert_right(tabs: &mut Vec<String>, current: &mut usize, pinned: 
 /// "Закрыть другие вкладки": остаются закреплённые и `idx`.
 /// Возвращает закрытые вкладки (url, старый индекс) и флаг "текущую вкладку закрыли - нужно загрузить другую страницу".
 /// Если текущая вкладка уцелела, она остаётся текущей, иначе текущей становится `idx`.
+#[allow(dead_code)]
 pub(crate) fn close_others(tabs: &mut Vec<String>, current: &mut usize, pinned: usize, idx: usize) -> (Vec<(String, usize)>, bool) {
     let old = std::mem::take(tabs);
     let mut removed = Vec::new();
@@ -142,8 +389,47 @@ pub(crate) fn close_others(tabs: &mut Vec<String>, current: &mut usize, pinned: 
     (removed, nav)
 }
 
+/// "Закрыть другие вкладки" вместе с синхронным обновлением `metas`.
+pub(crate) fn close_others_meta(
+    tabs: &mut Vec<String>,
+    metas: &mut Vec<TabMeta>,
+    current: &mut usize,
+    pinned: usize,
+    idx: usize,
+) -> (Vec<ClosedTab>, bool) {
+    ensure_metas(tabs, metas);
+    let old_tabs = std::mem::take(tabs);
+    let old_metas = std::mem::take(metas);
+    let mut removed = Vec::new();
+    let mut new_current = None;
+    let mut new_idx = 0;
+    for (i, (url, meta)) in old_tabs.into_iter().zip(old_metas.into_iter()).enumerate() {
+        if i < pinned || i == idx {
+            if i == *current {
+                new_current = Some(tabs.len());
+            }
+            if i == idx {
+                new_idx = tabs.len();
+            }
+            tabs.push(url);
+            metas.push(meta);
+        } else {
+            removed.push(ClosedTab {
+                url,
+                index: i,
+                was_pinned: false,
+                hist: meta.hist,
+            });
+        }
+    }
+    let nav = new_current.is_none();
+    *current = new_current.unwrap_or(new_idx);
+    (removed, nav)
+}
+
 /// "Закрыть вкладки справа": закрываются все обычные вкладки правее `idx`.
 /// Если текущая вкладка закрыта, текущей становится `idx` (и флаг `true`).
+#[allow(dead_code)]
 pub(crate) fn close_right(tabs: &mut Vec<String>, current: &mut usize, pinned: usize, idx: usize) -> (Vec<(String, usize)>, bool) {
     let old = std::mem::take(tabs);
     let mut removed = Vec::new();
@@ -152,6 +438,38 @@ pub(crate) fn close_right(tabs: &mut Vec<String>, current: &mut usize, pinned: u
             removed.push((url, i));
         } else {
             tabs.push(url);
+        }
+    }
+    let nav = *current > idx && *current >= pinned;
+    if nav {
+        *current = idx;
+    }
+    (removed, nav)
+}
+
+/// "Закрыть вкладки справа" вместе с синхронным обновлением `metas`.
+pub(crate) fn close_right_meta(
+    tabs: &mut Vec<String>,
+    metas: &mut Vec<TabMeta>,
+    current: &mut usize,
+    pinned: usize,
+    idx: usize,
+) -> (Vec<ClosedTab>, bool) {
+    ensure_metas(tabs, metas);
+    let old_tabs = std::mem::take(tabs);
+    let old_metas = std::mem::take(metas);
+    let mut removed = Vec::new();
+    for (i, (url, meta)) in old_tabs.into_iter().zip(old_metas.into_iter()).enumerate() {
+        if i > idx && i >= pinned {
+            removed.push(ClosedTab {
+                url,
+                index: i,
+                was_pinned: false,
+                hist: meta.hist,
+            });
+        } else {
+            tabs.push(url);
+            metas.push(meta);
         }
     }
     let nav = *current > idx && *current >= pinned;
@@ -218,6 +536,29 @@ mod tests {
         assert_eq!(filter_doc_msg("TITLE|bad id|x", &mut cur), None);
         assert_eq!(filter_doc_msg("LOAD_URL|nopipe", &mut cur), None);
     }
+
+    #[test]
+    fn tab_hist_isolates_back_and_forward() {
+        let mut h = TabHist::new("https://duckduckgo.com");
+        // Первичная нормализация слеша при загрузке не должна создавать дубликат в истории
+        h.record("https://duckduckgo.com/");
+        assert!(!h.can_back());
+        assert!(!h.can_forward());
+
+        h.record("https://rust-lang.org/");
+        assert!(h.can_back());
+        assert!(!h.can_forward());
+
+        assert_eq!(h.step_back().as_deref(), Some("https://duckduckgo.com/"));
+        h.record("https://duckduckgo.com/");
+        assert!(!h.can_back());
+        assert!(h.can_forward());
+
+        assert_eq!(h.step_forward().as_deref(), Some("https://rust-lang.org/"));
+        h.record("https://rust-lang.org/");
+        assert!(h.can_back());
+        assert!(!h.can_forward());
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +575,7 @@ mod tab_ops_tests {
         let tabs = v(&["https://www.example.com/", "https://b.org/x"]);
         assert_eq!(tabs_labels(&tabs, &titles, 1), "1\u{1e}example.com|||b.org");
         assert_eq!(tabs_labels(&tabs, &titles, 9), "2\u{1e}example.com|||b.org");
+        assert_eq!(tabs_hosts(&tabs), "www.example.com|||b.org");
     }
 
     #[test]
@@ -337,6 +679,47 @@ mod tab_ops_tests {
         assert_eq!(tabs, v(&["p1", "p2"]));
         assert!(nav);
         assert_eq!(cur, 0);
+    }
+}
+
+#[cfg(test)]
+mod fav_tests {
+    use super::*;
+
+    #[test]
+    fn fav_key_drops_www() {
+        assert_eq!(fav_key("https://www.Example.com/a").as_deref(), Some("example.com"));
+        assert_eq!(fav_key("https://b.org:8080/").as_deref(), Some("b.org"));
+        assert_eq!(fav_key("nope"), None);
+    }
+
+    #[test]
+    fn fav_values_are_validated() {
+        assert!(fav_value_ok("QUJD+/=="));
+        assert!(fav_value_ok("!2"));
+        assert!(!fav_value_ok(""));
+        assert!(!fav_value_ok("!"));
+        assert!(!fav_value_ok("a b"));
+        assert!(!fav_value_ok("a'b"));
+        assert!(!fav_value_ok(&"A".repeat(FAV_MAX_B64 + 1)));
+    }
+
+    #[test]
+    fn favs_js_lists_each_tab_host_once() {
+        let mut favs = HashMap::new();
+        favs.insert("example.com".to_string(), "QUJD".to_string());
+        favs.insert("other.org".to_string(), "!1".to_string());
+        favs.insert("unused.net".to_string(), "QUJD".to_string());
+        let tabs = vec![
+            "https://www.example.com/a".to_string(),
+            "https://example.com/b".to_string(),
+            "https://other.org/".to_string(),
+        ];
+        let js = favs_js(&favs, &tabs);
+        assert!(js.starts_with("if(window.__ulFavs) window.__ulFavs('{"));
+        assert_eq!(js.matches("example.com").count(), 1);
+        assert!(js.contains("\"other.org\":\"!1\""));
+        assert!(!js.contains("unused.net"));
     }
 }
 

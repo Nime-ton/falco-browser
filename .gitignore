@@ -1,3 +1,5 @@
 /target/
 /browser_profile/
+*.log
+*.tmp
 .DS_Store
